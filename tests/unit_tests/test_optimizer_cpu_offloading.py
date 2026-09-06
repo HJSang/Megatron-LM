@@ -92,7 +92,7 @@ def test_gpu_decoupled_grad_updates_and_skips_missing_grad(
     dtype: torch.dtype, offload_fraction: float, overlap: bool
 ) -> None:
     params = [torch.ones(32, device="cuda", dtype=dtype, requires_grad=True) for _ in range(2)]
-    reference_params = [torch.ones(32, requires_grad=True) for _ in range(2)]
+    reference_params = [torch.ones(32, device="cuda", requires_grad=True) for _ in range(2)]
     optimizer = HybridDeviceOptimizer(
         params,
         offload_fraction=offload_fraction,
@@ -102,7 +102,9 @@ def test_gpu_decoupled_grad_updates_and_skips_missing_grad(
         overlap_cpu_optimizer_d2h_h2d=overlap,
         lr=0.1,
     )
-    reference_optimizer = Adam(reference_params, lr=0.1)
+    # FusedAdam tracks bias-correction steps per group, unlike torch Adam's
+    # per-parameter counter, so use the actual GPU consumer as the reference.
+    reference_optimizer = GPUAdam(reference_params, lr=0.1)
     assert optimizer.param_to_inner_param[params[-1]].is_cuda
 
     for step in range(3):
@@ -118,7 +120,7 @@ def test_gpu_decoupled_grad_updates_and_skips_missing_grad(
         torch.cuda.synchronize()
         for param, reference in zip(params, reference_params):
             actual = optimizer.param_to_inner_param[param].detach().cpu()
-            torch.testing.assert_close(actual, reference.detach(), rtol=1e-6, atol=1e-7)
+            torch.testing.assert_close(actual, reference.detach().cpu(), rtol=1e-6, atol=1e-7)
             assert param.requires_grad
 
 
