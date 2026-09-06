@@ -80,20 +80,15 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self._init_sub_optimizers()
         self._register_load_state_dict_hooks()
 
-    def _set_sub_optimizer_grads(self):
+    def _set_sub_optimizer_grads(self) -> None:
         if self.param_update_in_fp32:
-            for param in self.param_to_fp32_param:
-                if param in self.gpu_params_map_cpu_copy:
-                    # Skip if the param is offloaded to CPU, it should be handled
-                    # in the following part.
-                    continue
-                fp32_param = self.param_to_fp32_param[param]
-                grad = getattr(param, "decoupled_grad", param.grad)
-                if grad is not None:
-                    fp32_param.grad = grad.to(fp32_param.dtype)
-                    fp32_param.requires_grad = True
-                else:
-                    fp32_param.requires_grad = False
+            for group in self.gpu_param_groups:
+                for inner_param in group["params"]:
+                    # Native FP32 parameters have no separate master copy, but
+                    # precision-aware training still supplies decoupled_grad.
+                    param = self.inner_param_to_orig_param[inner_param]
+                    grad = getattr(param, "decoupled_grad", param.grad)
+                    inner_param.grad = grad.to(inner_param.dtype) if grad is not None else None
 
         # Sync the grads from GPU to CPU.
         for optimizer in self.cpu_optimizers:

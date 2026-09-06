@@ -85,6 +85,43 @@ def setup_seed(seed):
     torch.backends.cudnn.benchmark = False  # Disable auto-tuner for reproducibility
 
 
+@pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize('offload_fraction', [0.0, 0.5])
+@pytest.mark.parametrize('overlap', [False, True])
+def test_gpu_decoupled_grad_updates_and_skips_missing_grad(
+    dtype: torch.dtype, offload_fraction: float, overlap: bool
+) -> None:
+    params = [torch.ones(32, device="cuda", dtype=dtype, requires_grad=True) for _ in range(2)]
+    reference_params = [torch.ones(32, requires_grad=True) for _ in range(2)]
+    optimizer = HybridDeviceOptimizer(
+        params,
+        offload_fraction=offload_fraction,
+        cpu_optimizer_cls=Adam,
+        gpu_optimizer_cls=GPUAdam,
+        param_update_in_fp32=True,
+        overlap_cpu_optimizer_d2h_h2d=overlap,
+        lr=0.1,
+    )
+    reference_optimizer = Adam(reference_params, lr=0.1)
+    assert optimizer.param_to_inner_param[params[-1]].is_cuda
+
+    for step in range(3):
+        for index, (param, reference) in enumerate(zip(params, reference_params)):
+            # A missing gradient must skip the GPU parameter without reusing
+            # its previous gradient or disabling subsequent autograd tracking.
+            missing = step == 1 and index == 1
+            param.grad = None
+            param.decoupled_grad = None if missing else torch.ones_like(param, dtype=torch.float32)
+            reference.grad = None if missing else torch.ones_like(reference)
+        optimizer.step()
+        reference_optimizer.step()
+        torch.cuda.synchronize()
+        for param, reference in zip(params, reference_params):
+            actual = optimizer.param_to_inner_param[param].detach().cpu()
+            torch.testing.assert_close(actual, reference.detach(), rtol=1e-6, atol=1e-7)
+            assert param.requires_grad
+
+
 def test_load_state_dict_with_native_fp32_param():
     """Round-trip state for a BF16 toy net with a parameter marked to stay in FP32."""
     model = Fp32MarkedToyNet().cuda()
