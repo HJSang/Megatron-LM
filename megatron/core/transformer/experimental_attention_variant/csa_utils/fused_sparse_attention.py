@@ -1972,6 +1972,27 @@ def _indexer_topk_core(
             del returned_buffers, actual, expected
         del compact_logits, compact_result
 
+        if deterministic:
+            # cuDNN's compact forward + Top-K returns a repeatable key *set* under
+            # ``deterministic=True`` but writes the slots in kernel arrival order, which
+            # differs call to call (about half of all rows at 33k x 1040, cuDNN Frontend
+            # 1.28.0). FlashMLA accumulates its online softmax in slot order, so a no-grad
+            # and a grad-enabled forward over the same weights would still round
+            # differently. Impose a canonical per-row order: ascending key id, ``-1``
+            # padding last, and carry the softmax along. Any fixed order restores bitwise
+            # agreement; ascending id matches the fallback's tie rule for equal scores.
+            # Written back in place so CUDA-graph workspace buffers keep aliasing.
+            padding_last = torch.where(
+                topk_indices < 0,
+                torch.full_like(topk_indices, torch.iinfo(topk_indices.dtype).max),
+                topk_indices,
+            )
+            canonical_order = torch.argsort(padding_last, dim=-1)
+            topk_indices.copy_(torch.gather(topk_indices, -1, canonical_order))
+            if compact_softmax is not None:
+                compact_softmax.copy_(torch.gather(compact_softmax, -1, canonical_order))
+            del padding_last, canonical_order
+
         topk_indices = topk_indices.int()
         topk_length = (topk_indices >= 0).sum(dim=-1).int()
         if is_thd:
