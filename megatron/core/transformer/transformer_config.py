@@ -53,6 +53,19 @@ except ImportError:
     HAVE_PACKAGING = False
 
 
+GATED_DELTA_NET_VARIANTS = ("gated_delta_net", "gdn")
+
+
+def is_gated_delta_net_variant(experimental_attention_variant: Optional[str]) -> bool:
+    """True for the Gated DeltaNet linear-attention variant under either of its names.
+
+    Upstream Megatron-LM renamed ``gated_delta_net`` to ``gdn`` (NVIDIA/Megatron-LM#5765) and
+    Megatron-Bridge ``main`` selects Qwen3.5's linear attention with the new name. miles-main
+    keeps ``gated_delta_net`` as the canonical spelling and treats ``gdn`` as an alias.
+    """
+    return experimental_attention_variant in GATED_DELTA_NET_VARIANTS
+
+
 @dataclass
 @experimental_api
 class TransformerConfig(ModelParallelConfig):
@@ -316,10 +329,13 @@ class TransformerConfig(ModelParallelConfig):
     # attention variant
     ####################
     experimental_attention_variant: Optional[
-        Literal['gated_delta_net', 'dsa', 'dsv4_hybrid', 'dsv4']
+        Literal['gated_delta_net', 'gdn', 'dsa', 'dsv4_hybrid', 'dsv4']
     ] = None
     """Type of attention variant to use. Currently support gated_delta_net, dsa, dsv4_hybrid, and
-    dsv4 (miles' DeepSeek-V4 sparse-attention path)."""
+    dsv4 (miles' DeepSeek-V4 sparse-attention path). 'gdn' is upstream Megatron-LM's name for
+    gated_delta_net (NVIDIA/Megatron-LM#5765) and is accepted as an alias: it is normalized to
+    'gated_delta_net' in __post_init__, and every check goes through is_gated_delta_net_variant so a
+    value assigned after construction (Megatron-Bridge sets it on the provider) is recognized too."""
 
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
     """How THD sequence rows are partitioned across context-parallel ranks.
@@ -1497,6 +1513,10 @@ class TransformerConfig(ModelParallelConfig):
         """
         super().__post_init__()
 
+        if self.experimental_attention_variant == "gdn":
+            # Upstream spelling (NVIDIA/Megatron-LM#5765); canonicalize so every check below matches.
+            self.experimental_attention_variant = "gated_delta_net"
+
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.
         if self.fp32_residual_connection and self.pipeline_dtype is not None:
@@ -1626,14 +1646,16 @@ class TransformerConfig(ModelParallelConfig):
                         "cp_partition_mode='contiguous' is not supported with "
                         "multi_latent_attention outside dsv4_hybrid."
                     )
-                if self.experimental_attention_variant not in ("dsv4_hybrid", "gated_delta_net"):
+                if self.experimental_attention_variant != "dsv4_hybrid" and not is_gated_delta_net_variant(
+                    self.experimental_attention_variant
+                ):
                     raise ValueError(
                         "cp_partition_mode='contiguous' with context parallelism currently "
                         "requires experimental_attention_variant to be either 'dsv4_hybrid' "
                         "or 'gated_delta_net'."
                     )
                 if (
-                    self.experimental_attention_variant == "gated_delta_net"
+                    is_gated_delta_net_variant(self.experimental_attention_variant)
                     and self.linear_cp_mode == "headwise"
                 ):
                     raise ValueError(
@@ -1677,12 +1699,12 @@ class TransformerConfig(ModelParallelConfig):
                 )
                 self.dsa_kernel_backend = legacy_backend
 
-        if self.experimental_attention_variant in ["gated_delta_net"]:
+        if is_gated_delta_net_variant(self.experimental_attention_variant):
             assert (
                 self.linear_attention_freq is not None
             ), f"linear_attention_freq must be set for linear attention."
 
-            if self.experimental_attention_variant == "gated_delta_net":
+            if is_gated_delta_net_variant(self.experimental_attention_variant):
                 if self.pad_packed_seq_alignment is not None:
                     tail_policy = self.thd_tail_padding_policy or 'append_dummy_seq'
                     assert tail_policy == 'append_dummy_seq', (
@@ -1853,7 +1875,7 @@ class TransformerConfig(ModelParallelConfig):
 
         if (
             self.gdn_pre_gated_delta_rule_fusion
-            and self.experimental_attention_variant != "gated_delta_net"
+            and not is_gated_delta_net_variant(self.experimental_attention_variant)
         ):
             raise ValueError(
                 "gdn_pre_gated_delta_rule_fusion is only supported with "
@@ -2259,7 +2281,7 @@ class TransformerConfig(ModelParallelConfig):
 
             if (
                 "gdn_norm_out" in self.recompute_modules
-                and self.experimental_attention_variant != "gated_delta_net"
+                and not is_gated_delta_net_variant(self.experimental_attention_variant)
             ):
                 raise ValueError(
                     "gdn_norm_out in recompute_modules is only supported with "
@@ -2268,7 +2290,7 @@ class TransformerConfig(ModelParallelConfig):
 
             if (
                 "gdn" in self.recompute_modules
-                and self.experimental_attention_variant != "gated_delta_net"
+                and not is_gated_delta_net_variant(self.experimental_attention_variant)
             ):
                 raise ValueError(
                     "gdn in recompute_modules is only supported with "
@@ -3208,7 +3230,7 @@ class TransformerConfig(ModelParallelConfig):
             and (not self.cuda_graph_modules or CudaGraphModule.attn in self.cuda_graph_modules)
         )
 
-        cp_layout_conversion_required = self.experimental_attention_variant == "gated_delta_net"
+        cp_layout_conversion_required = is_gated_delta_net_variant(self.experimental_attention_variant)
         # TODO: Extend this predicate as GDN2/KDA are introduced, and for DSv4 when
         # dsa_cp_balance_indexer is introduced; those paths will also require module-local THD CP
         # layout conversion.
